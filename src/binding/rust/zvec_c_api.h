@@ -821,6 +821,50 @@ ZvecStr zvec_group_result_get_group_value(const ZvecGroupResult* result);
 /// same thread.
 const ZvecDocList* zvec_group_result_get_docs(const ZvecGroupResult* result);
 
+// ============================================================================
+// SIMD Distance Functions
+// ============================================================================
+
+/// Compute squared L2 (Euclidean) distance between two f32 vectors.
+/// Uses SIMD-optimized implementation from zvec core.
+/// @param a First vector
+/// @param b Second vector
+/// @param dim Vector dimension
+/// @return Squared L2 distance
+float zvec_compute_l2_distance(const float* a, const float* b, size_t dim);
+
+/// Compute inner product distance between two f32 vectors.
+/// Uses SIMD-optimized implementation from zvec core.
+/// @param a First vector
+/// @param b Second vector
+/// @param dim Vector dimension
+/// @return Inner product value
+float zvec_compute_ip_distance(const float* a, const float* b, size_t dim);
+
+/// Compute cosine distance between two f32 vectors.
+/// Uses SIMD-optimized implementation from zvec core.
+/// Note: input vectors should be pre-normalized with norms appended.
+/// @param a First vector
+/// @param b Second vector
+/// @param dim Vector dimension (including extra norm elements)
+/// @return Cosine distance (1 - cosine_similarity)
+float zvec_compute_cosine_distance(const float* a, const float* b, size_t dim);
+
+/// Compute squared L2 distance from a query vector to N database vectors (batch).
+/// Each database vector is contiguous in memory: vectors[i*dim .. (i+1)*dim].
+/// @param query Query vector (dim elements)
+/// @param vectors Packed database vectors (n * dim elements)
+/// @param n Number of database vectors
+/// @param dim Vector dimension
+/// @param distances Output array (n elements, caller-allocated)
+void zvec_compute_l2_distance_batch(
+    const float* query,
+    const float* vectors,
+    size_t n,
+    size_t dim,
+    float* distances
+);
+
 #ifdef __cplusplus
 }
 #endif

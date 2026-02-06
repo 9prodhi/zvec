@@ -21,6 +21,7 @@
 #include <zvec/db/query_params.h>
 #include <zvec/db/options.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -28,6 +29,17 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+
+// SIMD-optimized distance functions.
+// We use direct computation to avoid template linkage issues with
+// the SquaredEuclideanDistanceMatrix templates when compiled by cc::Build
+// without whole-archive linking of libzvec_ailego.
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+#ifdef __SSE2__
+#include <immintrin.h>
+#endif
 
 // ============================================================================
 // Internal types and helpers
@@ -1703,6 +1715,144 @@ const ZvecDocList* zvec_group_result_get_docs(const ZvecGroupResult* result) {
         temp_list.list.push_back(std::make_shared<zvec::Doc>(doc));
     }
     return &temp_list;
+}
+
+// ============================================================================
+// SIMD Distance Functions
+//
+// Self-contained implementations to avoid template linkage issues when
+// shim.cc is compiled independently by cc::Build. Uses NEON on aarch64,
+// SSE/AVX on x86, and scalar fallback otherwise.
+// ============================================================================
+
+static float compute_squared_l2(const float* a, const float* b, size_t dim) {
+    float sum = 0.0f;
+    size_t i = 0;
+#ifdef __ARM_NEON
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        float32x4_t diff = vsubq_f32(va, vb);
+        acc = vfmaq_f32(acc, diff, diff);
+    }
+    sum = vaddvq_f32(acc);
+#elif defined(__AVX2__)
+    __m256 acc256 = _mm256_setzero_ps();
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc256 = _mm256_fmadd_ps(diff, diff, acc256);
+    }
+    // Horizontal sum of 8 floats
+    __m128 hi = _mm256_extractf128_ps(acc256, 1);
+    __m128 lo = _mm256_castps256_ps128(acc256);
+    __m128 sum128 = _mm_add_ps(lo, hi);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum = _mm_cvtss_f32(sum128);
+#elif defined(__SSE2__)
+    __m128 acc128 = _mm_setzero_ps();
+    for (; i + 4 <= dim; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 diff = _mm_sub_ps(va, vb);
+        acc128 = _mm_add_ps(acc128, _mm_mul_ps(diff, diff));
+    }
+    // Horizontal sum of 4 floats
+    __m128 shuf = _mm_movehdup_ps(acc128);
+    __m128 sums = _mm_add_ps(acc128, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    sum = _mm_cvtss_f32(sums);
+#endif
+    // Scalar tail
+    for (; i < dim; ++i) {
+        float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+static float compute_inner_product(const float* a, const float* b, size_t dim) {
+    float sum = 0.0f;
+    size_t i = 0;
+#ifdef __ARM_NEON
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        acc = vfmaq_f32(acc, va, vb);
+    }
+    sum = vaddvq_f32(acc);
+#elif defined(__AVX2__)
+    __m256 acc256 = _mm256_setzero_ps();
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        acc256 = _mm256_fmadd_ps(va, vb, acc256);
+    }
+    __m128 hi = _mm256_extractf128_ps(acc256, 1);
+    __m128 lo = _mm256_castps256_ps128(acc256);
+    __m128 sum128 = _mm_add_ps(lo, hi);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum = _mm_cvtss_f32(sum128);
+#elif defined(__SSE2__)
+    __m128 acc128 = _mm_setzero_ps();
+    for (; i + 4 <= dim; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        acc128 = _mm_add_ps(acc128, _mm_mul_ps(va, vb));
+    }
+    __m128 shuf = _mm_movehdup_ps(acc128);
+    __m128 sums = _mm_add_ps(acc128, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    sum = _mm_cvtss_f32(sums);
+#endif
+    for (; i < dim; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+float zvec_compute_l2_distance(const float* a, const float* b, size_t dim) {
+    if (!a || !b || dim == 0) return 0.0f;
+    return compute_squared_l2(a, b, dim);
+}
+
+float zvec_compute_ip_distance(const float* a, const float* b, size_t dim) {
+    if (!a || !b || dim == 0) return 0.0f;
+    return compute_inner_product(a, b, dim);
+}
+
+float zvec_compute_cosine_distance(const float* a, const float* b, size_t dim) {
+    if (!a || !b || dim == 0) return 0.0f;
+    // Cosine distance = 1 - (a . b) / (|a| * |b|)
+    float dot = 0.0f, norm_a = 0.0f, norm_b = 0.0f;
+    for (size_t i = 0; i < dim; ++i) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    float denom = std::sqrt(norm_a * norm_b);
+    if (denom < 1e-30f) return 1.0f;
+    return 1.0f - dot / denom;
+}
+
+void zvec_compute_l2_distance_batch(
+    const float* query,
+    const float* vectors,
+    size_t n,
+    size_t dim,
+    float* distances
+) {
+    if (!query || !vectors || !distances || n == 0 || dim == 0) return;
+    for (size_t i = 0; i < n; ++i) {
+        distances[i] = compute_squared_l2(vectors + i * dim, query, dim);
+    }
 }
 
 } // extern "C"
